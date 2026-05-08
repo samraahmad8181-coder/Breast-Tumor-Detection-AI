@@ -251,8 +251,8 @@ function renderRecent(scans){
 /* ---------- SHOW RESULT ---------- */
 function showResult(data){
   resultPanel.classList.remove('hidden');
-  const imgUrl = data.image_url ? (API_URL + (data.image_url.startsWith('/') ? data.image_url : '/' + data.image_url)) : '';
-  const gradUrl = data.gradcam_url ? (API_URL + (data.gradcam_url.startsWith('/') ? data.gradcam_url : '/' + data.gradcam_url)) : '';
+  const imgUrl = data.image_path || data.image_url || '';
+  const gradUrl = data.gradcam_path || data.gradcam_url || '';
 
   resultPanel.innerHTML = `
     <div class="flex items-start justify-between">
@@ -398,12 +398,12 @@ async function downloadReport(id){
   try{
     const res = await fetch(`${API_URL}/download-report/${id}`, { headers: authHeaders() });
     if(!res.ok) throw new Error('Report not found');
-    const blob = await res.blob();
-    const url = window.URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url; a.download = `Report_${id}.pdf`;
-    document.body.appendChild(a); a.click(); a.remove();
-    window.URL.revokeObjectURL(url);
+    const data = await res.json();
+    if (data.url) {
+        window.open(data.url, '_blank');
+    } else {
+        throw new Error('Report URL not found');
+    }
   }catch(e){
     console.error(e);
     alert('Download failed');

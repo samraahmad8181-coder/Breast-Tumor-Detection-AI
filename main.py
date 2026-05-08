@@ -1,34 +1,24 @@
 from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File, Form
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from prediction import predict_breast_tumor
 
-from sqlalchemy.orm import Session
-from datetime import timedelta
 import os
 import uuid
 from typing import Optional
+from datetime import datetime
 
-from database import engine, get_db, Base
-from models import Doctor, Scan
-from auth import (
-    verify_password, get_password_hash, create_access_token,
-    ACCESS_TOKEN_EXPIRE_MINUTES, get_current_doctor
-)
+from database import supabase, supabase_admin
+from auth import get_current_doctor
 from prediction import predict_breast_tumor, load_model
 from pdf_generator import generate_medical_report
 
 # ------------------------
-# Database setup
-# ------------------------
-Base.metadata.create_all(bind=engine)
-
-# ------------------------
 # FastAPI app
 # ------------------------
-app = FastAPI(title="Breast Tumor Detection API")
+app = FastAPI(title="Breast Tumor Detection AI (Supabase)")
 
 # ------------------------
 # CORS
@@ -42,7 +32,7 @@ app.add_middleware(
 )
 
 # ------------------------
-# Directories
+# Directories (Legacy for local processing, then upload to Supabase)
 # ------------------------
 os.makedirs("uploads", exist_ok=True)
 os.makedirs("reports", exist_ok=True)
@@ -52,7 +42,6 @@ os.makedirs("reports", exist_ok=True)
 # ------------------------
 app.mount("/app", StaticFiles(directory="front-end", html=True), name="front-end")
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
-app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # ------------------------
 # Load model on startup
@@ -60,7 +49,7 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 @app.on_event("startup")
 async def startup_event():
     load_model()
-    print("✅ Model loaded successfully!")
+    print("[OK] Model loaded successfully!")
 
 # ============================================================
 # AUTH ENDPOINTS
@@ -70,71 +59,60 @@ async def signup(
     email: str = Form(...),
     password: str = Form(...),
     full_name: str = Form(...),
-    license_number: str = Form(...),
-    db: Session = Depends(get_db)
+    license_number: str = Form(...)
 ):
-    existing_doctor = db.query(Doctor).filter(Doctor.email == email).first()
-    if existing_doctor:
-        raise HTTPException(status_code=400, detail="Email already registered")
-    
-    existing_license = db.query(Doctor).filter(Doctor.license_number == license_number).first()
-    if existing_license:
-        raise HTTPException(status_code=400, detail="License number already registered")
-    
-    hashed_password = get_password_hash(password)
-    new_doctor = Doctor(
-        email=email,
-        full_name=full_name,
-        license_number=license_number,
-        hashed_password=hashed_password
-    )
-    
-    db.add(new_doctor)
-    db.commit()
-    db.refresh(new_doctor)
-    
-    return {"message": "Doctor registered successfully", "doctor_id": new_doctor.id}
+    try:
+        # Sign up with Supabase
+        res = supabase.auth.sign_up({
+            "email": email,
+            "password": password,
+            "options": {
+                "data": {
+                    "full_name": full_name,
+                    "license_number": license_number
+                }
+            }
+        })
+        
+        if not res.user:
+            raise HTTPException(status_code=400, detail="Registration failed")
+        
+        return {"message": "Doctor registered successfully. Please check your email for confirmation.", "doctor_id": res.user.id}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.post("/login")
 async def login(
-    form_data: OAuth2PasswordRequestForm = Depends(),
-    db: Session = Depends(get_db)
+    form_data: OAuth2PasswordRequestForm = Depends()
 ):
-    doctor = db.query(Doctor).filter(Doctor.email == form_data.username).first()
-    
-    if not doctor or not verify_password(form_data.password, doctor.hashed_password):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect email or password",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    
-    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    access_token = create_access_token(
-        data={"sub": doctor.email}, expires_delta=access_token_expires
-    )
-    
-    return {
-        "access_token": access_token,
-        "token_type": "bearer",
-        "doctor": {
-            "id": doctor.id,
-            "email": doctor.email,
-            "full_name": doctor.full_name,
-            "license_number": doctor.license_number
+    try:
+        res = supabase.auth.sign_in_with_password({
+            "email": form_data.username,
+            "password": form_data.password
+        })
+        
+        if not res.session:
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+        
+        user = res.user
+        return {
+            "access_token": res.session.access_token,
+            "token_type": "bearer",
+            "doctor": {
+                "id": user.id,
+                "email": user.email,
+                "full_name": user.user_metadata.get("full_name"),
+                "license_number": user.user_metadata.get("license_number")
+            }
         }
-    }
+    except Exception as e:
+        raise HTTPException(status_code=401, detail="Incorrect email or password")
 
 
 @app.get("/me")
-async def get_current_user(current_doctor: Doctor = Depends(get_current_doctor)):
-    return {
-        "id": current_doctor.id,
-        "email": current_doctor.email,
-        "full_name": current_doctor.full_name,
-        "license_number": current_doctor.license_number
-    }
+async def get_current_user(current_doctor: dict = Depends(get_current_doctor)):
+    return current_doctor
 
 # ============================================================
 # PREDICTION ENDPOINT
@@ -145,8 +123,7 @@ async def predict_tumor(
     patient_name: str = Form(...),
     patient_id: str = Form(...),
     notes: Optional[str] = Form(None),
-    current_doctor: Doctor = Depends(get_current_doctor),
-    db: Session = Depends(get_db)
+    current_doctor: dict = Depends(get_current_doctor)
 ):
     if not file.content_type.startswith('image/'):
         raise HTTPException(status_code=400, detail="File must be an image")
@@ -155,77 +132,117 @@ async def predict_tumor(
     image_filename = f"{unique_id}_original.jpg"
     gradcam_filename = f"{unique_id}_gradcam.jpg"
 
-    image_path = os.path.join("uploads", image_filename)
-    gradcam_path = os.path.join("uploads", gradcam_filename)
+    local_image_path = os.path.join("uploads", image_filename)
+    local_gradcam_path = os.path.join("uploads", gradcam_filename)
 
     image_bytes = await file.read()
 
     try:
-        result = await predict_breast_tumor(image_bytes, image_path, gradcam_path)
+        # Run prediction
+        result = await predict_breast_tumor(image_bytes, local_image_path, local_gradcam_path)
         prediction = result["prediction"]
         confidence = result["confidence"]
         malignant_percentage = result["malignant_percentage"]
+        
+        # -------------------------------
+        # Upload to Supabase Storage
+        # -------------------------------
+        # Create buckets if they don't exist (only needed once, but safe to call)
+        try:
+            supabase.storage.create_bucket("scans", options={"public": True})
+        except: pass
+        
+        # Upload original
+        with open(local_image_path, "rb") as f:
+            supabase.storage.from_("scans").upload(image_filename, f)
+        
+        # Upload GradCAM
+        with open(local_gradcam_path, "rb") as f:
+            supabase.storage.from_("scans").upload(gradcam_filename, f)
+            
+        # Get Public URLs
+        image_url = supabase.storage.from_("scans").get_public_url(image_filename)
+        gradcam_url = supabase.storage.from_("scans").get_public_url(gradcam_filename)
+
+        # -------------------------------
+        # Save scan in Supabase Database
+        # -------------------------------
+        scan_data = {
+            "doctor_id": current_doctor["id"],
+            "patient_name": patient_name,
+            "patient_id": patient_id,
+            "image_path": image_url,
+            "gradcam_path": gradcam_url,
+            "prediction": prediction,
+            "confidence": confidence,
+            "malignant_percentage": malignant_percentage,
+            "notes": notes,
+            "scan_date": datetime.utcnow().isoformat()
+        }
+        
+        db_res = supabase.table("scans").insert(scan_data).execute()
+        new_scan = db_res.data[0]
+
+        # -------------------------------
+        # Generate PDF report and upload
+        # -------------------------------
+        local_pdf_path = os.path.join("reports", f"Report_{new_scan['id']}.pdf")
+        generate_medical_report({
+            "patient_name": patient_name,
+            "patient_id": patient_id,
+            "scan_date": scan_data["scan_date"],
+            "doctor_name": current_doctor["full_name"],
+            "prediction": prediction,
+            "confidence": confidence,
+            "malignant_percentage": malignant_percentage,
+            "image_path": local_image_path,
+            "gradcam_path": local_gradcam_path,
+            "notes": notes
+        }, local_pdf_path)
+        
+        pdf_filename = f"Report_{new_scan['id']}.pdf"
+        with open(local_pdf_path, "rb") as f:
+            supabase.storage.from_("reports").upload(pdf_filename, f)
+            
+        pdf_url = supabase.storage.from_("reports").get_public_url(pdf_filename)
+
+        return {
+            "scan_id": new_scan["id"],
+            "prediction": prediction,
+            "confidence": confidence,
+            "malignant_percentage": malignant_percentage,
+            "image_url": image_url,
+            "gradcam_url": gradcam_url,
+            "patient_name": patient_name,
+            "patient_id": patient_id,
+            "pdf_url": pdf_url
+        }
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Operation failed: {str(e)}")
 
-    # -------------------------------
-    # Save scan in database (FIXED)
-    # -------------------------------
-    new_scan = Scan(
-        doctor_id=current_doctor.id,
-        patient_name=patient_name,
-        patient_id=patient_id,
-        image_path=image_path,
-        prediction=prediction,
-        confidence=confidence,
-        malignant_percentage=malignant_percentage,   # ✔ ADDED
-        gradcam_path=gradcam_path,
-        notes=notes
-    )
 
-    db.add(new_scan)
-    db.commit()
-    db.refresh(new_scan)
+@app.get("/scans")
+async def get_scans(current_doctor: dict = Depends(get_current_doctor)):
+    try:
+        res = supabase.table("scans").select("*").eq("doctor_id", current_doctor["id"]).order("scan_date", desc=True).execute()
+        return res.data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-    # -------------------------------
-    # Generate PDF report
-    # -------------------------------
-    pdf_path = os.path.join("reports", f"Report_{new_scan.id}.pdf")
-    generate_medical_report({
-        "patient_name": patient_name,
-        "patient_id": patient_id,
-        "scan_date": new_scan.scan_date.strftime("%Y-%m-%d %H:%M:%S"),
-        "doctor_name": current_doctor.full_name,
-        "prediction": prediction,
-        "confidence": confidence,
-        "malignant_percentage": malignant_percentage,
-        "image_path": image_path,
-        "gradcam_path": gradcam_path,
-        "notes": notes
-    }, pdf_path)
 
-    return {
-        "scan_id": new_scan.id,
-        "prediction": prediction,
-        "confidence": confidence,
-        "malignant_percentage": malignant_percentage,
-        "image_url": f"/uploads/{image_filename}",
-        "gradcam_url": f"/uploads/{gradcam_filename}",
-        "patient_name": patient_name,
-        "patient_id": patient_id,
-        "scan_date": new_scan.scan_date.isoformat(),
-        "pdf_url": f"/download-report/{new_scan.id}"
-    }
-
-# ============================================================
-# DOWNLOAD REPORT ENDPOINT
-# ============================================================
 @app.get("/download-report/{scan_id}")
 async def download_report(scan_id: str):
-    pdf_path = f"reports/Report_{scan_id}.pdf"
-    if not os.path.exists(pdf_path):
+    # In Supabase version, we just redirect to the public URL or fetch from storage
+    pdf_filename = f"Report_{scan_id}.pdf"
+    try:
+        url = supabase.storage.from_("reports").get_public_url(pdf_filename)
+        return {"url": url}
+    except Exception:
         raise HTTPException(status_code=404, detail="Report not found")
-    return FileResponse(path=pdf_path, filename=f"Report_{scan_id}.pdf", media_type='application/pdf')
+
 
 # ============================================================
 # RUN

@@ -1,26 +1,24 @@
 # database.py
-from sqlalchemy import create_engine
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
+import os
+from dotenv import load_dotenv
+from supabase import create_client, Client
 
-# SQLite database
-DATABASE_URL = "sqlite:///./app_data.db"
+# Load environment variables
+load_dotenv()
 
-# Create engine
-engine = create_engine(
-    DATABASE_URL, connect_args={"check_same_thread": False}  # needed for SQLite
-)
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 
-# SessionLocal class to create DB sessions
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+if not SUPABASE_URL or not SUPABASE_KEY:
+    raise ValueError("SUPABASE_URL and SUPABASE_KEY must be set in .env file")
 
-# Base class for models
-Base = declarative_base()
+# Initialize Supabase client
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# Dependency to get DB session
+# Initialize Supabase Admin client (using service key) for administrative tasks
+supabase_admin: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+
+# Dependency for FastAPI (optional now, but kept for compatibility)
 def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+    return supabase
